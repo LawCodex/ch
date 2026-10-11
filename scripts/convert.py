@@ -14,6 +14,7 @@ import re
 import sys
 import unicodedata
 from pathlib import Path
+from urllib.parse import urljoin
 
 from lxml import etree
 
@@ -57,7 +58,8 @@ def ws(s):
 
 
 class Conv:
-    def __init__(self):
+    def __init__(self, base=""):
+        self.base = base
         self.notes = []
         self.lines = []
 
@@ -68,11 +70,14 @@ class Conv:
         for ch in el:
             out.append(self.inline_el(ch, ctx))
             out.append(ws(ch.tail or ""))
-        return "".join(out)
+        s = "".join(out).replace("****", "")
+        return re.sub(r"(?<![*\w])\*([^*\n]+)\*\*([^*\n]+)\*(?![*\w])", r"*\1\2*", s)
 
     def inline_el(self, el, ctx):
         n = ln(el)
         if n is None:
+            return ""
+        if n == "placeholder":
             return ""
         if n == "authorialNote":
             txt = " ".join(t for t in (self.inline(p, "note").strip() for p in el) if t)
@@ -81,7 +86,18 @@ class Conv:
             self.notes.append(txt)
             return f"[^{len(self.notes)}]"
         if n == "br":
-            return "<br>" if ctx in ("cell", "head") else ("  \n" if ctx == "p" else " ")
+            return "<br>" if ctx == "cell" else ("  \n" if ctx == "p" else " ")
+        if n in ("quotedStructure", "embeddedStructure"):
+            if not len(el) and not (el.text or "").strip():
+                return ""
+            if ctx != "p":
+                return " " + self.flat_text(el) + " "
+            sub = Conv(self.base)
+            sub.notes = self.notes
+            for ch in el:
+                sub.block(ch, 7)
+            txt = re.sub(r"\n{3,}", "\n\n", "\n".join(sub.lines).strip())
+            return "\n\n" + "\n".join("> " + x if x else ">" for x in txt.split("\n")) + "\n\n"
         inner = self.inline(el, ctx)
         if n == "b":
             return wrap(inner, "**")
@@ -97,7 +113,7 @@ class Conv:
                 return f"[{inner.strip()}]({href})" + (" " if inner.endswith(" ") else "")
             return inner
         if n == "img":
-            src = el.get("src", "")
+            src = urljoin(self.base, el.get("src", ""))
             return f"![{el.get('alt', '')}]({src})"
         if n in ("p", "block", "blockList", "item", "content", "table"):
             # block inside inline context (rare): flatten
@@ -172,7 +188,12 @@ class Conv:
                     continue
                 if pending and cn == "content":
                     kids = [k for k in ch if ln(k)]
-                    if kids and ln(kids[0]) == "p":
+                    if kids and ln(kids[0]) in ("blockList", "list") and len(kids[0]) \
+                            and ln(kids[0][0]) == "listIntroduction":
+                        self.para(pending + self.inline(kids[0][0], "p").strip())
+                        self.list_block(kids[0], level, indent, skip_first=True)
+                        kids = kids[1:]
+                    elif kids and ln(kids[0]) == "p":
                         self.para(pending + self.inline(kids[0], "p").strip())
                         kids = kids[1:]
                     else:
@@ -200,18 +221,7 @@ class Conv:
             self.para(self.inline(el, "p"))
             return
         if n == "blockList" or n == "list":
-            for ch in el:
-                cn = ln(ch)
-                if cn == "item":
-                    self.item(ch, level, indent)
-                elif cn in ("listIntroduction", "listWrapUp"):
-                    t = self.inline(ch, "p").strip()
-                    if t:
-                        self.emit(indent + t)
-                        self.emit()
-                else:
-                    self.block(ch, level, indent)
-            self.emit()
+            self.list_block(el, level, indent)
             return
         if n == "table":
             self.table(el)
@@ -220,6 +230,20 @@ class Conv:
             return
         # unknown: treat as paragraph text
         self.para(self.inline(el, "p"))
+
+    def list_block(self, el, level, indent, skip_first=False):
+        for ch in (el[1:] if skip_first else el):
+            cn = ln(ch)
+            if cn == "item":
+                self.item(ch, level, indent)
+            elif cn in ("listIntroduction", "listWrapUp"):
+                t = self.inline(ch, "p").strip()
+                if t:
+                    self.emit(indent + t)
+                    self.emit()
+            else:
+                self.block(ch, level, indent)
+        self.emit()
 
     def item(self, el, level, indent):
         num = el.find(f"{{{AKN}}}num")
@@ -337,6 +361,7 @@ class Conv:
 
 
 def md_inline_to_html(s):
+    s = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r'<img alt="\1" src="\2">', s)
     s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
     s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', s)
     return s
@@ -359,7 +384,7 @@ def convert_file(path, entry, lang, retrieved):
     tree = etree.parse(str(path))
     root = tree.getroot()
     act = root[0]
-    c = Conv()
+    c = Conv(entry["files"][lang]["url"])
     title = entry["titles"].get(lang) or entry["titles"].get("de") or entry["sr"]
     title = ws(title).strip()
     c.emit(f"# {title}")
